@@ -1,42 +1,96 @@
-# water-quality-system
+AquaWave: Wireless Water-Quality Monitoring with a Custom SDR Receiver
 
-## Inspiration
-Water quality is essential for healthy ecosystems and communities, but monitoring environmental conditions can require expensive equipment and complex infrastructure. We wanted to create a wireless monitoring system that could collect sensor data and make it accessible through cloud technology.
+Team Perry the Platypus · Knight Hacks IX · October 2026
 
-This inspired AquaWave, a project combining embedded systems, software-defined radio, and cloud analytics to explore a more accessible approach to environmental monitoring.
+AquaWave is a low-cost wireless water-quality monitor. An Arduino node reads temperature, turbidity, and pH and transmits them over 433.8 MHz GFSK. An ADALM-Pluto software-defined radio running our own Python demodulator recovers the packets, and the readings flow through MQTT and Amazon S3 into Databricks for analysis and visualization.
 
-## What it does
-AquaWave collects water-quality data using a temperature, pH, and turbidity sensor to predict the chance of an algae bloom. An Arduino transmits the readings wirelessly through a CC1101 radio module, while an ADALM-Pluto software-defined radio receives and decodes the signals.
+Note on pH: after about eight hours of unreliable readings from the pH probe, we replaced it with a potentiometer so the rest of the pipeline could be tested end to end. pH values in this project are simulated and are flagged as such (ph_is_simulated) in every record.
 
-The decoded measurements are published through MQTT and uploaded to Amazon S3 as JSON batches. Databricks provides a foundation for analyzing historical sensor data, while our dashboard is designed to visualize readings and environmental changes.
+<!-- TODO: add a screenshot of the live spectrum / waterfall here --> <!-- ![Pluto spectrum and waterfall](docs/waterfall.png) -->
+Architecture
+Sensors ─► Arduino UNO R4 WiFi ─► CC1101 radio (433.8 MHz, 10 kbps GFSK)
+                                          │  over the air
+                                          ▼
+                               ADALM-Pluto SDR (IQ at 1 MS/s)
+                                          │
+                         Python receiver (custom demodulator)
+                                          │  JSON over MQTT (topic: knighthacks/water)
+                                          ▼
+                         mqtt_to_s3.py ─► Amazon S3 (JSON batches)
+                                          │  Databricks Auto Loader
+                                          ▼
+                         Bronze ─► Silver ─► Gold ─► Dashboard
+Transmitter (Arduino + CC1101)
+Item	Detail
+Board	Arduino UNO R4 WiFi
+Radio	CC1101, 433.8 MHz, 10 kbps, ±40 kHz deviation, Gaussian-shaped 2-FSK
+Framing	64-bit preamble, sync word 0x1234, fixed 32-byte payload, PN9 whitening, 16-bit CRC
+Power	−10 dBm (low-power bench testing; only transmit where permitted)
+Temperature	OneWire digital sensor on D2 (DallasTemperature library)
+Turbidity	Analog sensor on A1 (20-sample average, 10-bit ADC)
+pH	Simulated with a potentiometer on A0, mapped to 0–14
+Rate	about 1 packet every 2 s (sensor conversion + averaging + 1 s delay)
 
-## How we built it
-We started with an Arduino UNO R4 WiFi connected to our sensor inputs and a CC1101 radio operating at 433 MHz. The Arduino collects measurements and transmits them wirelessly.
+Packets are short ASCII strings, for example:
 
-On the receiving side, we used an ADALM-Pluto SDR and developed custom Python digital signal-processing code to recover the transmitted data. Our decoder processes frequency-shift-keyed signals, synchronizes with packets, and reconstructs the sensor readings.
+T=23.75;U=483;P=13.12;S=1
 
-We then connected the decoded telemetry to MQTT and built a Python pipeline that uploads JSON batches to Amazon S3. We configured a Databricks external location to support cloud-based analysis and worked on a dashboard for visualizing the data.
+T is temperature in °C, U is the turbidity ADC value, P is pH, and S=1 means the pH value is simulated.
 
-## Challenges we ran into
-Our biggest challenge was the pH sensor. We spent approximately eight hours troubleshooting inconsistent readings before deciding to replace it with a potentiometer. This allowed us to simulate pH changes while keeping the rest of our system functional and avoiding inaccurate measurements.
+Receiver (ADALM-Pluto + Python)
 
-Another major challenge was decoding wireless transmissions using the Pluto SDR. Recovering digital packets from raw radio signals required debugging frequency offsets, timing, synchronization, and signal processing.
+The receiver does not use a prebuilt demodulator. Each captured buffer goes through:
 
-Connecting the embedded hardware, radio receiver, MQTT, and cloud services also required careful coordination to keep the data flowing consistently.
+Burst detection: smoothed magnitude against a percentile-based noise floor.
+FM discriminator: phase difference of consecutive IQ samples gives instantaneous frequency.
+Adaptive 2-FSK slicing: the two frequency levels are estimated per burst and the decision threshold is set at their midpoint, which also compensates for carrier frequency offset.
+Symbol-timing search: candidate samples-per-bit and phase offsets, with mid-symbol integration.
+Polarity search: both bit polarities are tried.
+Sync and preamble validation: exact 0x1234 correlation plus a preamble error check.
+PN9 de-whitening and parsing: the 32-byte payload is de-whitened, parsed, and published to MQTT as JSON.
 
-## Accomplishments that we're proud of
-Our proudest accomplishment was successfully transmitting sensor data over radio and decoding it with our own software-defined radio receiver. Instead of relying on a conventional receiver, we implemented the signal-processing pipeline ourselves.
+Published JSON:
 
-We also established live MQTT telemetry and successfully uploaded JSON batches to Amazon S3. Bringing together embedded hardware, wireless communication, Python, and cloud infrastructure into one system was a major achievement for our team.
+json
+{"temperature_c": 23.75, "turbidity_adc": 483, "ph_simulated": 13.12, "ph_is_simulated": true}
 
-## What we learned
-AquaWave gave us hands-on experience with embedded programming, RF communication, digital signal processing, MQTT, and cloud infrastructure.
+A separate script (pluto_spectrum.py) shows a live spectrum and waterfall for locating and debugging the signal.
 
-We learned how software can recover information from raw radio signals and how sensor measurements can move from physical hardware into cloud storage and analytics.
+Cloud pipeline
+MQTT → S3: decoded readings are published to a local Mosquitto broker, then uploaded to S3 as JSON batches.
+Bronze: Databricks Auto Loader incrementally ingests the S3 JSON into a Delta table with an explicit schema.
+Silver: removes duplicate rows and rows with missing fields.
+Gold: 1-minute window aggregates (average temperature, turbidity, and pH, plus a reading count) that feed the dashboard.
+<!-- TODO: add a dashboard screenshot using the overnight data range --> <!-- ![Dashboard](docs/dashboard.png) -->
+Results
+Metric	Value
+Expected rate (from firmware timing)	about 30 packets/min
+Observed at 3 m	typically 26–29 decoded readings/min, estimated 90%+ packet reception
+Observed at 4 m	noticeably more decode glitches
+Logged data	about 7 hours across two sessions (10/10 19:14 UTC to 10/11 13:17 UTC, with a gap)
+Total readings	<!-- TODO: SELECT SUM(reading_count) FROM workspace.default.water_quality_gold -->
 
-Most importantly, we learned how to adapt when hardware does not behave as expected. Our pH sensor difficulties reinforced the importance of reliable measurements, honest reporting, and making practical engineering decisions under time constraints.
+The reception figure is an estimate (decoded readings per minute against the rate implied by the transmitter loop), not a counted result from a sequence-numbered test.
 
-## What's next for AquaWave
-We plan to integrate a properly calibrated pH sensor, improve wireless reliability, expand our Databricks analytics, and develop more advanced environmental alerts.
+Known limitations and next steps
+pH is simulated. Next step is a properly calibrated pH sensor.
+The decoder does not yet verify the CC1101 CRC. Corrupted packets that still parse as valid text can get through, which showed up as outlier values at 4 m. Adding a CRC check and counting CRC passes and failures would give a measured packet success rate.
+The gold layer uses averages. In minutes with only a few readings, a single bad packet skews the result. A median or a minimum-count filter would be more robust.
+Range is limited. Next steps include a higher receiver gain, a narrower receive bandwidth, and overlapping capture buffers so packets spanning two buffers are not lost.
+Algae-bloom risk estimation is future work. The system collects the inputs (temperature, turbidity, pH); a risk model and alerts are not implemented yet.
+Single node. The design could extend to multiple sensor nodes.
+Run it
 
-In the future, AquaWave could support multiple wireless sensor nodes and provide a more comprehensive platform for monitoring water conditions.
+Requirements: Arduino IDE with RadioLib, OneWire, and DallasTemperature; Python 3 with pyadi-iio, numpy, paho-mqtt, and matplotlib; a local Mosquitto broker; an ADALM-Pluto; an AWS account with an S3 bucket; a Databricks workspace.
+
+Flash the transmitter sketch in firmware/ to the Arduino and power it.
+Start Mosquitto on 127.0.0.1:1883.
+Set your Pluto URI in receiver/pluto_receiver.py, then run it.
+Run cloud/mqtt_to_s3.py with your AWS credentials configured (environment variables or an AWS profile; never commit keys).
+In Databricks, run the notebooks in databricks/ in order: bronze, silver, gold.
+Repository layout
+firmware/      Arduino transmitter sketch
+receiver/      Pluto receiver and spectrum viewer
+cloud/         MQTT-to-S3 uploader
+databricks/    Bronze ingestion notebook, silver and gold SQL
+docs/          Screenshots
